@@ -15,7 +15,7 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 
-#define ARXSH_VERSION "0.2"
+#define ARXSH_VERSION "0.2.1"
 
 extern char **environ;
 
@@ -79,26 +79,60 @@ static job_t *job_last(void) {
 }
 static void job_remove(job_t *j) { free(j->cmdline); j->cmdline = NULL; j->used = 0; }
 
+/* ---------- child-status reaper ----------
+   The ONLY place waitpid is called. Statuses are recorded by PID and read
+   back with reap_peek(); records live until reap_drop(). This replaces the
+   old pattern where every waiter called waitpid(-1) itself and could
+   consume a status event belonging to a different job, losing it. */
+#define MAX_REAPED 1024
+typedef struct { pid_t pid; int status; int has_status; int used; } reap_t;
+static reap_t reap_table[MAX_REAPED];
+static int reap_no_children = 0;
+
+static reap_t *reap_slot(pid_t pid, int create) {
+    reap_t *free_slot = NULL;
+    for (int i = 0; i < MAX_REAPED; i++) {
+        if (reap_table[i].used && reap_table[i].pid == pid) return &reap_table[i];
+        if (!reap_table[i].used && !free_slot) free_slot = &reap_table[i];
+    }
+    if (create && free_slot) { free_slot->used = 1; free_slot->pid = pid; free_slot->has_status = 0; free_slot->status = 0; return free_slot; }
+    return NULL;
+}
+static void reap_watch(pid_t pid) { (void)reap_slot(pid, 1); }
+static void reap_drop(pid_t pid) { reap_t *s = reap_slot(pid, 0); if (s) s->used = 0; }
+static int reap_peek(pid_t pid, int *out_status) {
+    reap_t *s = reap_slot(pid, 0);
+    if (s && s->has_status) { *out_status = s->status; return 1; }
+    return 0;
+}
+static void reap_children(void) {
+    int st; pid_t r;
+    reap_no_children = 0;
+    while ((r = waitpid(-1, &st, WNOHANG | WUNTRACED | WCONTINUED)) > 0) {
+        reap_t *s = reap_slot(r, 1);
+        if (s) { s->status = st; s->has_status = 1; }
+    }
+    if (r < 0 && errno == ECHILD) reap_no_children = 1;
+}
+
 /* sweep background jobs before each prompt; report finished/stopped ones */
 static void jobs_sweep(void) {
+    reap_children();
     for (int i = 0; i < MAX_JOBS; i++) {
         if (!jobs[i].used) continue;
         job_t *j = &jobs[i];
-        /* Only a fresh waitpid report may change the recorded state:
-           an already-reported stop returns 0 ("nothing new"), which must
-           not be read as "running again". */
         int alive = 0, newly_stopped = 0;
         for (int k = 0; k < j->npids; k++) {
-            if (j->pids[k] <= 0) continue;              /* already reaped */
-            int st; pid_t r = waitpid(j->pids[k], &st, WNOHANG | WUNTRACED | WCONTINUED);
-            if (r == 0) alive++;
-            else if (r > 0 && WIFSTOPPED(st)) { newly_stopped = 1; alive++; }
-            else if (r > 0 && WIFCONTINUED(st)) { j->stopped = 0; alive++; }
-            else if (r > 0) j->pids[k] = -1;            /* exited or signaled */
-            else j->pids[k] = -1;                       /* ECHILD: gone */
+            int st;
+            if (reap_peek(j->pids[k], &st)) {
+                if (WIFSTOPPED(st)) { newly_stopped = 1; alive++; }
+                else if (WIFCONTINUED(st)) { j->stopped = 0; alive++; }
+                /* exited/signaled: terminal record, counts as done */
+            } else alive++;
         }
         if (!alive) {
             printf("[%d] Done\t\t%s\n", j->id, j->cmdline);
+            for (int k = 0; k < j->npids; k++) reap_drop(j->pids[k]);
             job_remove(j);
         } else if (newly_stopped && !j->stopped) {
             j->stopped = 1;
@@ -666,22 +700,28 @@ static void cmds_free(cmd_t *cmds, int nc) {
 /* ---------- builtins ---------- */
 /* is_builtin lives with the interactive helpers (it shares builtin_names) */
 
-/* wait for a set of pids (foreground). Returns 1 if any stopped. */
+/* wait for a set of pids (foreground) by polling the reaper.
+   Returns 1 if any stopped. Records are NOT consumed here: the caller
+   drops them once the command or job is fully finished, so a job that
+   stops keeps the exit records of the stages that already finished. */
 static int wait_for_pids(pid_t *pids, int npids, int *out_status) {
-    int remaining = npids, stopped = 0, status = 0;
-    while (remaining > 0) {
-        int st; pid_t r = waitpid(-1, &st, WUNTRACED);
-        if (r < 0) break;
-        int idx = -1;
-        for (int i = 0; i < npids; i++) if (pids[i] == r) idx = i;
-        if (idx < 0) continue;                    /* not ours / already reaped */
-        if (WIFSTOPPED(st)) { stopped = 1; break; }
-        pids[idx] = -1;
-        remaining--;
-        if (idx == npids - 1) {
-            if (WIFEXITED(st)) status = WEXITSTATUS(st);
-            else if (WIFSIGNALED(st)) status = 128 + WTERMSIG(st);
+    int stopped = 0, status = 0;
+    for (;;) {
+        reap_children();
+        int remaining = 0;
+        for (int i = 0; i < npids; i++) {
+            if (pids[i] <= 0) continue;
+            int st;
+            if (reap_peek(pids[i], &st)) {
+                if (WIFSTOPPED(st)) stopped = 1;
+                else if (WIFEXITED(st)) { if (i == npids - 1) status = WEXITSTATUS(st); }
+                else if (WIFSIGNALED(st)) { if (i == npids - 1) status = 128 + WTERMSIG(st); }
+                else remaining++;            /* continued: still running */
+            } else remaining++;
         }
+        if (stopped || remaining == 0) break;
+        if (reap_no_children) break;        /* nothing left to wait for */
+        { struct timespec ts = { 0, 1000000 }; nanosleep(&ts, NULL); }   /* 1 ms poll */
     }
     if (out_status) *out_status = status;
     return stopped;
@@ -786,6 +826,7 @@ static int run_builtin(cmd_t *cmd) {
         if (isatty(STDIN_FILENO)) tcsetpgrp(STDIN_FILENO, shell_pgid);
         if (stopped) { j->stopped = 1; printf("[%d] Stopped\t\t%s\n", j->id, j->cmdline); return 128 + SIGTSTP; }
         last_status = status;
+        for (int k = 0; k < j->npids; k++) reap_drop(j->pids[k]);
         job_remove(j);
         return status;
     }
@@ -838,7 +879,18 @@ static void execute_pipeline(cmd_t *cmds, int nc, int background, const char *cm
     pid_t pgid = 0;
     for (int i = 0; i < nc; i++) {
         pid_t pid = fork();
-        if (pid < 0) { perror("arxsh: fork"); last_status = 1; return; }
+        if (pid < 0) {
+            /* partial pipeline failure: kill what already started, reap it, bail */
+            perror("arxsh: fork");
+            if (pgid > 0) {
+                kill(-pgid, SIGKILL);
+                int dummy = 0; (void)wait_for_pids(pids, i, &dummy);
+                for (int k = 0; k < i; k++) reap_drop(pids[k]);
+            }
+            for (int k = 0; k < nc - 1; k++) { close(pipes[k][0]); close(pipes[k][1]); }
+            last_status = 1;
+            return;
+        }
         if (pid == 0) {
             /* child */
             if (pgid == 0) setpgid(0, 0); else setpgid(0, pgid);
@@ -863,6 +915,7 @@ static void execute_pipeline(cmd_t *cmds, int nc, int background, const char *cm
         if (pgid == 0) pgid = pid;
         setpgid(pid, pgid);
         pids[i] = pid;
+        reap_watch(pid);
     }
     for (int k = 0; k < nc - 1; k++) { close(pipes[k][0]); close(pipes[k][1]); }
 
@@ -883,6 +936,7 @@ static void execute_pipeline(cmd_t *cmds, int nc, int background, const char *cm
         last_status = 128 + SIGTSTP;
     } else {
         last_status = status;
+        for (int k = 0; k < nc; k++) reap_drop(pids[k]);
     }
     if (timing) {
         struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);

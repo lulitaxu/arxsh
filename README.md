@@ -12,7 +12,9 @@ Every tool I use lives inside a shell, and every serious security exploit eventu
 
 ## Status
 
-Version 0.2. All five build phases implemented, plus a signature interactive layer no stock shell ships with. arxsh is a working daily-driver shell, still growing.
+Version 0.2.1. All five build phases implemented, plus a signature interactive layer no stock shell ships with. arxsh is a working daily-driver shell, still growing.
+
+Where this is going: [docs/STRATEGY.md](docs/STRATEGY.md) — arxsh is becoming an observability-first shell (native execution traces, command intelligence, session replay; the Execution Observatory lands in v0.4). Run the regression suite with `make test`.
 
 ## Features
 
