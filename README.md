@@ -12,15 +12,37 @@ Every tool I use lives inside a shell, and every serious security exploit eventu
 
 ## Status
 
-In active development. Phase 1 in progress.
+Version 0.2. All five build phases implemented, plus a signature interactive layer no stock shell ships with. arxsh is a working daily-driver shell, still growing.
+
+## Features
+
+- Hand-written tokenizer and parser: no readline, no borrowed shell code
+- Pipes and redirection: `|`, `>`, `>>`, `<`, combinable in one line
+- Real job control: process groups, terminal handoff (`tcsetpgrp`), `&` background jobs, `jobs` / `fg` / `bg`, Ctrl-C and Ctrl-Z behave the way they should
+- Quoting and escapes: single quotes, double quotes, backslash
+- Expansion: `$VAR`, `${VAR}`, `$?`, `~`, and globbing (`*`, `?`)
+- Line editing in raw mode: arrow-key history, Ctrl-A/E/U/K/W/L, history persisted to `~/.arxsh_history`
+- Builtins: `cd`, `exit`, `help`, `export`, `unset`, `alias`, `unalias`, `jobs`, `fg`, `bg`, `history`
+- `~/.arxshrc` startup file, aliases, and a prompt that shows the last exit status when a command fails
+
+## What makes it different
+
+Stock shells wait for you to press Enter before telling you anything. arxsh talks back while you type:
+
+- **Ghost suggestions.** Start typing and arxsh completes the line from your history in dim text. Right arrow takes the whole suggestion, and you keep typing to ignore it.
+- **Live tinting.** The command name is green when arxsh can actually run it and red when it cannot, checked against builtins, aliases, your PATH, and folders as you type. Quoted strings glow amber, operators stand out bold.
+- **Did-you-mean.** Mistype a command and arxsh guesses the fix: `gti` gets "did you mean 'git'?", scored with Damerau edit distance (a letter swap counts as one slip, the way fingers actually make it) over builtins, aliases, and every executable on your PATH.
+- **Auto-cd.** Type a folder name on its own and you are inside it. No `cd`, no ceremony.
+- **A right prompt with the truth in it.** Clock, how many jobs you have open, and the exact exit code of the last command when it failed.
+- **Receipts for slow commands.** Anything that takes two seconds or more reports how long it took, right when it finishes.
 
 ## Roadmap
 
-- [ ] **Phase 1 — Core.** Prompt loop, tokenizing input, `fork` + `execvp`, builtins (`cd`, `exit`, `help`), honest error messages
-- [ ] **Phase 2 — Plumbing.** Pipes (`|`) and redirection (`>`, `>>`, `<`)
-- [ ] **Phase 3 — Job control.** Background jobs (`&`), `jobs` / `fg` / `bg`, SIGINT and SIGTSTP handled the way a real shell handles them
-- [ ] **Phase 4 — Feel.** Quoting and escapes, `$VAR` expansion, globbing, history and raw-mode line editing (arrow keys, Ctrl-A/E/U)
-- [ ] **Phase 5 — Home.** `~/.arxshrc` startup file, aliases, a prompt that earns its place
+- [x] **Phase 1 — Core.** Prompt loop, tokenizing input, `fork` + `execvp`, builtins (`cd`, `exit`, `help`), honest error messages
+- [x] **Phase 2 — Plumbing.** Pipes (`|`) and redirection (`>`, `>>`, `<`)
+- [x] **Phase 3 — Job control.** Background jobs (`&`), `jobs` / `fg` / `bg`, SIGINT and SIGTSTP handled the way a real shell handles them
+- [x] **Phase 4 — Feel.** Quoting and escapes, `$VAR` expansion, globbing, history and raw-mode line editing (arrow keys, Ctrl-A/E/U)
+- [x] **Phase 5 — Home.** `~/.arxshrc` startup file, aliases, a prompt that earns its place
 
 ## Build and run
 

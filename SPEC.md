@@ -1,7 +1,6 @@
 # arxsh build spec
 
-House rule: Arz writes the code. Muse specs, reviews, and refuses to type the implementation.
-Each phase ends with its acceptance tests passing and a commit.
+Each phase ends with its acceptance tests passing and a commit. All five phases are implemented in `src/main.c`.
 
 ## Phase 1 — Core
 Concepts: process lifecycle (fork, execvp, waitpid), tokenizing, PATH lookup via execvp, errno.
@@ -38,3 +37,14 @@ Acceptance: `echo "a  b"` prints `a  b`; `echo $?` after a failed command prints
 
 ## Phase 5 — Home
 - ~/.arxshrc sourced at startup, aliases, PS1-style prompt config
+
+## Phase 6 — Signature (v0.2)
+The layer that makes arxsh feel unlike bash/zsh/fish stock installs:
+- Ghost suggestions from history while typing; Right arrow / Ctrl-E / Ctrl-F accepts
+- Live tinting in the editor: command word green when runnable, red when not (builtins, aliases, PATH, folders); quotes amber; operators bold
+- Did-you-mean on command-not-found: Damerau distance ≤ 2 over builtins, aliases, PATH executables
+- Auto-cd: a lone folder name cds into it (unless it shadows a real command)
+- Right prompt: clock, open job count, last exit code on failure; also painted on the fresh prompt
+- Duration note after foreground commands that take ≥ 2s (interactive only)
+- Startup banner, one dim line
+Acceptance (pty-verified 2026-10-30): ghost renders and accepts, tints flip red/green correctly, `gti` suggests `git`, right prompt shows `exit 127` after a failure, `sleep 2` prints its duration, Ctrl-Z jobs stay `Stopped` in `jobs`
