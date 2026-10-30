@@ -5,9 +5,11 @@
 Baseline stabilization (strategy Phase 0). No behaviour changes except the
 process-lifecycle fix.
 
-- Regression suite: `tests/run_integration.sh` (24 scripted cases) and
+- Regression suite: `tests/run_integration.sh` (31 scripted cases,
+  including malformed input and a no-zombie reaping check) and
   `tests/run_pty.py` (15 interactive cases), wired as `make test`;
-  `make test-asan` runs the integration suite under ASan/UBSan.
+  `make test-asan` runs the integration suite under ASan/UBSan with
+  leak detection (clean).
 - Centralized child-status reaper: `waitpid` now happens in exactly one
   place and statuses are recorded by PID. Fixes the race where a foreground
   wait could consume a background job's exit status and lose it.
@@ -17,6 +19,9 @@ process-lifecycle fix.
   plus a sanitizer job.
 - `docs/STRATEGY.md` adopted: observability-first direction, milestones
   v0.3 to v1.0.
+- Known limitations documented in the README and
+  `docs/compatibility.md` (no `&&`/`||`/`;` yet, no command substitution,
+  no control structures, and the rest of the honest list).
 
 ## v0.2.0 — 2026-10-30
 

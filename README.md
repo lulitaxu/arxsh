@@ -46,6 +46,23 @@ Stock shells wait for you to press Enter before telling you anything. arxsh talk
 - [x] **Phase 4 — Feel.** Quoting and escapes, `$VAR` expansion, globbing, history and raw-mode line editing (arrow keys, Ctrl-A/E/U)
 - [x] **Phase 5 — Home.** `~/.arxshrc` startup file, aliases, a prompt that earns its place
 
+## Known limitations (v0.2.1)
+
+arxsh is a working shell, not a bash replacement yet. The honest list:
+
+- No command lists: `&&`, `||`, and `;` are not parsed yet (v0.3, top priority)
+- No command substitution (`$(...)`, backticks), here-docs, arithmetic expansion, or shell functions
+- No control structures (`if`, `for`, `while`): arxsh runs commands, it is not a scripting language yet
+- No tab completion: ghost suggestions and history fill that gap for now
+- An unterminated quote closes at end of line instead of continuing to the next line
+- Globbing triggers on `*` and `?` only (no `[...]` classes), and a pattern with no match stays literal
+- A pipeline's exit status is its last stage's (no pipefail)
+- Background job Done/Stopped notices print at the next prompt, not asynchronously mid-typing
+- No Ctrl-R history search; history is saved on exit, so a hard kill loses that session's entries
+- Custom `PS1` supports `\w`, `\u`, `\$` escapes only
+
+Full detail: [docs/compatibility.md](docs/compatibility.md). Direction: [docs/STRATEGY.md](docs/STRATEGY.md).
+
 ## Build and run
 
 ```sh

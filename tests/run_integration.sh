@@ -75,8 +75,35 @@ echo foo=$FOO'                                                                  
 expect_out "jobs lists background"      'sleep 3 &
 jobs'                                                                                  'sleep 3'
 expect_out "builtin in pipeline"        'history | grep echo'                          'echo'
+expect_out "unterminated quote survives" 'echo "unterminated
+echo after=$?'                                                                          'after=0'
+expect_out "redirection w/o target"     'echo hi >
+echo redir=$?'                                                                          'redir=2'
+expect_out "leading pipe is an error"   '| wc -l
+echo lead=$?'                                                                           'lead=2'
+expect_out "double pipe is an error"    'echo a | | wc
+echo mid=$?'                                                                            'mid=2'
+expect_out "trailing pipe is an error"  'ls |
+echo trail=$?'                                                                          'trail=2'
+expect_out "comment line ignored"       '# just a comment
+echo final-ok'                                                                          'final-ok'
 expect_rc  "exit code propagates"       'exit 3'                                       3
 expect_rc  "clean exit is zero"         'echo done'                                    0
+
+# zombie check: a live shell that finishes 3 background jobs and sweeps
+# must end up with zero children (every child reaped, none left defunct).
+FIFO="$TMP/fifo"; mkfifo "$FIFO"
+(cd "$TMP/work" && HOME="$HOME" timeout 15 "$BIN" < "$FIFO" > "$TMP/zout" 2>&1) &
+exec 9> "$FIFO"
+printf 'sleep 0.3 &\nsleep 0.3 &\nsleep 0.3 &\n' >&9
+sleep 1.5
+printf 'true\n' >&9
+sleep 0.7
+printf 'exit\n' >&9
+exec 9>&-
+sleep 0.5
+DONES=$(grep -c 'Done' "$TMP/zout" || true)
+if [ "$DONES" -eq 3 ]; then ok "no zombies: all 3 bg jobs reaped and reported"; else bad "zombie check (Done notices: $DONES)"; fi
 
 echo "integration: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
