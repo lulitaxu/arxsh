@@ -1,5 +1,7 @@
 # arxsh
 
+<img src="brand/arxsh-logo-1024.png" width="120" alt="arxsh logo">
+
 A Unix shell written from scratch in C. No frameworks, no borrowed parser, no readline. Just fork, exec, and an unhealthy curiosity about how the thing I type into all day actually works.
 
 Built by [arxu](https://github.com/lulitaxu) on Arch Linux, in public, one phase at a time.
