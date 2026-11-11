@@ -35,6 +35,18 @@ Acceptance: `sleep 30 &` returns instantly, `jobs` lists it, `fg` reattaches, Ct
 - Raw-mode line editing (termios): arrows through history, Ctrl-A/E/U/K, history kept in memory and ~/.arxsh_history
 Acceptance: `echo "a  b"` prints `a  b`; `echo $?` after a failed command prints nonzero; Up arrow recalls
 
+## Expansion note (audit run-1, informational)
+
+Unquoted expansion results undergo pathname expansion, exactly as in bash:
+with `FOO='*'`, `echo $FOO` globs the value and lists the current directory.
+Expanded values are NOT re-tokenised or word-split, and operators inside a
+value (`|`, `>`, `$(...)`) stay inert bytes of a single word. An expansion
+inside double quotes is protected from globbing. This bash-parity behaviour
+is intentional; it is recorded here because an inherited environment value
+is an untrusted input, so users should quote `"$FOO"` when a value must be
+treated as inert text. (A zsh-like no-glob-on-expansion default was
+considered and not adopted.)
+
 ## Phase 5 — Home
 - ~/.arxshrc sourced at startup, aliases, PS1-style prompt config
 

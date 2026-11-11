@@ -11,6 +11,7 @@
 #include <time.h>
 #include <dirent.h>
 #include <sys/types.h>
+#include <sys/select.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
@@ -26,15 +27,41 @@ extern char **environ;
 static int last_status = 0;
 static pid_t shell_pgid;
 
+/* ---------- allocation helpers ----------
+   A shell cannot meaningfully continue without its line/token buffers, so
+   allocation failure is fatal and loud rather than a NULL dereference. */
+static void *xmalloc(size_t n) {
+    void *p = malloc(n);
+    if (!p) { fprintf(stderr, "arxsh: out of memory\n"); exit(1); }
+    return p;
+}
+static void *xrealloc(void *ptr, size_t n) {
+    void *p = realloc(ptr, n);
+    if (!p) { fprintf(stderr, "arxsh: out of memory\n"); exit(1); }
+    return p;
+}
+
 /* ---------- small dynamic string ---------- */
 typedef struct { char *buf; size_t len, cap; } sb_t;
-static void sb_init(sb_t *s) { s->cap = 64; s->len = 0; s->buf = malloc(s->cap); s->buf[0] = 0; }
+static void sb_init(sb_t *s) { s->cap = 64; s->len = 0; s->buf = xmalloc(s->cap); s->buf[0] = 0; }
 static void sb_putc(sb_t *s, char c) {
-    if (s->len + 2 > s->cap) { s->cap *= 2; s->buf = realloc(s->buf, s->cap); }
+    if (s->len + 2 > s->cap) { s->cap *= 2; s->buf = xrealloc(s->buf, s->cap); }
     s->buf[s->len++] = c; s->buf[s->len] = 0;
 }
 static void sb_puts(sb_t *s, const char *t) { while (*t) sb_putc(s, *t++); }
 static void sb_free(sb_t *s) { free(s->buf); s->buf = NULL; s->len = s->cap = 0; }
+
+/* Visibly encode C0/DEL control bytes so strings arxsh did not author
+   (directory names, history entries) cannot inject terminal escape
+   sequences (OSC 52, title/screen manipulation) when rendered.
+   Bytes >= 0x80 are left alone: they are UTF-8 lead/continuation bytes,
+   never a bare ESC, and stripping them would corrupt multibyte text. */
+static void sanitize_controls(char *s) {
+    for (char *p = s; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c < 32 || c == 127) *p = '?';
+    }
+}
 
 static char *xstrdup(const char *s) { char *p = strdup(s); if (!p) { perror("strdup"); exit(1); } return p; }
 
@@ -78,6 +105,10 @@ static job_t *job_last(void) {
     return best;
 }
 static void job_remove(job_t *j) { free(j->cmdline); j->cmdline = NULL; j->used = 0; }
+static int job_table_has_free(void) {
+    for (int i = 0; i < MAX_JOBS; i++) if (!jobs[i].used) return 1;
+    return 0;
+}
 
 /* ---------- child-status reaper ----------
    The ONLY place waitpid is called. Statuses are recorded by PID and read
@@ -148,17 +179,22 @@ static char *history_list[MAX_HISTORY];
 static int history_count = 0;
 static void history_add(const char *line) {
     if (!line || !*line) return;
-    if (history_count > 0 && strcmp(history_list[history_count - 1], line) == 0) return;
+    /* Store a sanitised copy only: the executed line is a separate copy and
+       is unaffected, but a planted history file must not be able to emit
+       raw escape sequences via ghost text or Up-arrow recall. */
+    char *clean = xstrdup(line);
+    sanitize_controls(clean);
+    if (history_count > 0 && strcmp(history_list[history_count - 1], clean) == 0) { free(clean); return; }
     if (history_count >= MAX_HISTORY) {
         free(history_list[0]);
         memmove(history_list, history_list + 1, sizeof(char *) * (MAX_HISTORY - 1));
         history_count = MAX_HISTORY - 1;
     }
-    history_list[history_count++] = xstrdup(line);
+    history_list[history_count++] = clean;
 }
 static char *history_path(void) {
     const char *home = getenv("HOME"); if (!home) home = ".";
-    char *p = malloc(strlen(home) + 32);
+    char *p = xmalloc(strlen(home) + 32);
     sprintf(p, "%s/.arxsh_history", home);
     return p;
 }
@@ -175,10 +211,18 @@ static void history_load(void) {
 }
 static void history_save(void) {
     char *p = history_path();
-    FILE *f = fopen(p, "w"); free(p);
-    if (!f) return;
+    /* Write to a temp file in the same directory, then rename over the
+       target: atomic (a crash mid-write cannot corrupt the history file)
+       and rename replaces a planted symlink itself instead of following
+       it to truncate its target. */
+    char *tmp = xmalloc(strlen(p) + 32);
+    snprintf(tmp, strlen(p) + 32, "%s.tmp%ld", p, (long)getpid());
+    FILE *f = fopen(tmp, "w");
+    if (!f) { free(tmp); free(p); return; }
     for (int i = 0; i < history_count; i++) fprintf(f, "%s\n", history_list[i]);
-    fclose(f);
+    if (fclose(f) != 0 || rename(tmp, p) != 0) remove(tmp);
+    free(tmp);
+    free(p);
 }
 
 /* ---------- aliases ---------- */
@@ -223,16 +267,21 @@ static int term_width(void) {
     return 80;
 }
 
-/* printable width of a string that may contain ANSI color sequences */
+/* printable width of a string that may contain ANSI color sequences.
+   Counts UTF-8 codepoints, not bytes: continuation bytes and raw control
+   bytes take no cells, so multibyte text no longer skews the right-prompt
+   placement and cursor math. */
 static int visible_len(const char *s) {
     int n = 0;
-    for (const char *p = s; *p; p++) {
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
         if (*p == '\033' && p[1] == '[') {
             p += 2;
             while (*p && !((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z'))) p++;
             if (!*p) break;
             continue;
         }
+        if (*p < 32 || *p == 127) continue;          /* zero-width controls */
+        if ((*p & 0xC0) == 0x80) continue;           /* UTF-8 continuation byte */
         n++;
     }
     return n;
@@ -392,6 +441,9 @@ static void build_prompt(sb_t *out) {
         snprintf(short_cwd, sizeof(short_cwd), "~%s", cwd + strlen(home));
     else
         snprintf(short_cwd, sizeof(short_cwd), "%s", cwd);
+    /* cwd is a filesystem name arxsh did not author: a directory named
+       with ESC/OSC bytes must render as inert text, not terminal input. */
+    sanitize_controls(short_cwd);
     if (ps1) {
         for (const char *p = ps1; *p; p++) {
             if (p[0] == '\\' && p[1] == 'w') { sb_puts(out, short_cwd); p++; }
@@ -411,7 +463,39 @@ static void build_prompt(sb_t *out) {
 
 /* ---------- line editor (raw mode, tty only) ---------- */
 static struct termios orig_termios;
-static void term_restore(void) { tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios); }
+static void term_restore(void) {
+    /* leave bracketed-paste mode on every editor exit path */
+    ssize_t w = write(STDOUT_FILENO, "\033[?2004l", 8);
+    (void)w;
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
+}
+
+/* One byte with a timeout, for escape-sequence parsing: a truncated or
+   parameterised sequence must give up cleanly instead of blocking until
+   it swallows the user's next keystroke. Returns the byte, or -1. */
+static int read_byte_timeout(int timeout_ms) {
+    fd_set rf;
+    FD_ZERO(&rf);
+    FD_SET(STDIN_FILENO, &rf);
+    struct timeval tv = { timeout_ms / 1000, (timeout_ms % 1000) * 1000 };
+    if (select(STDIN_FILENO + 1, &rf, NULL, NULL, &tv) <= 0) return -1;
+    unsigned char b;
+    if (read(STDIN_FILENO, &b, 1) != 1) return -1;
+    return (int)b;
+}
+
+/* Insert one byte at the cursor, growing the line buffer safely. */
+static void line_insert(sb_t *line, size_t *pos, char ch) {
+    if (line->len + 2 > line->cap) {
+        size_t ncap = line->cap ? line->cap * 2 : 64;
+        line->buf = xrealloc(line->buf, ncap);
+        line->cap = ncap;
+    }
+    memmove(line->buf + *pos + 1, line->buf + *pos, line->len - *pos + 1);
+    line->buf[*pos] = ch;
+    (*pos)++;
+    line->len++;
+}
 
 /* Returns a malloc'd line, or NULL on EOF (Ctrl-D on empty line). */
 static char *read_line_tty(const char *prompt) {
@@ -420,6 +504,10 @@ static char *read_line_tty(const char *prompt) {
     raw.c_iflag &= ~(IXON);
     raw.c_cc[VMIN] = 1; raw.c_cc[VTIME] = 0;
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+    /* ask the terminal for bracketed paste: pasted text then arrives
+       wrapped in ESC[200~ .. ESC[201~ and is inserted as inert text,
+       executed only when the user presses Enter themselves */
+    fputs("\033[?2004h", stdout);
 
     sb_t line; sb_init(&line);
     size_t pos = 0;
@@ -454,6 +542,7 @@ static char *read_line_tty(const char *prompt) {
         if (c == 3) { /* Ctrl-C: discard the line */
             fputs("^C\r\n", stdout); fflush(stdout);
             term_restore();
+            sb_free(&line);
             free(saved);
             last_status = 130;
             return xstrdup("");
@@ -472,15 +561,21 @@ static char *read_line_tty(const char *prompt) {
         }
         else if (c == 12) { fputs("\033[2J\033[H", stdout); }  /* Ctrl-L */
         else if (c == 27) {                           /* escape sequences */
-            char seq[2];
-            if (read(STDIN_FILENO, &seq[0], 1) != 1) continue;
-            if (seq[0] != '[') continue;
-            if (read(STDIN_FILENO, &seq[1], 1) != 1) continue;
-            if (seq[1] == 'A' || seq[1] == 'B') {     /* history up/down */
-                if (seq[1] == 'A' && hist > 0) {
+            /* Continuation bytes are read with a timeout: a truncated
+               sequence is dropped cleanly instead of blocking until it
+               swallows the next keystroke, and a parameterised sequence
+               is consumed whole instead of leaving residue like "00~"
+               in the line as literal text. */
+            int s0 = read_byte_timeout(100);
+            if (s0 < 0) goto redraw;                  /* lone ESC: drop */
+            if (s0 != '[') goto redraw;               /* SS3/other: drop */
+            int s1 = read_byte_timeout(100);
+            if (s1 < 0) goto redraw;                  /* truncated CSI: drop */
+            if (s1 == 'A' || s1 == 'B') {             /* history up/down */
+                if (s1 == 'A' && hist > 0) {
                     if (hist == history_count) { free(saved); saved = xstrdup(line.buf); }
                     hist--;
-                } else if (seq[1] == 'B' && hist < history_count) {
+                } else if (s1 == 'B' && hist < history_count) {
                     hist++;
                 } else goto redraw;
                 const char *src = (hist == history_count) ? (saved ? saved : "") : history_list[hist];
@@ -488,21 +583,72 @@ static char *read_line_tty(const char *prompt) {
                 sb_puts(&line, src);
                 pos = line.len;
             }
-            else if (seq[1] == 'C') {                 /* Right arrow */
+            else if (s1 == 'C') {                     /* Right arrow */
                 if (pos < line.len) pos++;
                 else if (sugg_full[0]) {              /* at end of line: accept the ghost */
                     line.len = 0; line.buf[0] = 0; sb_puts(&line, sugg_full); pos = line.len;
                 }
             }
-            else if (seq[1] == 'D') { if (pos > 0) pos--; }
-            else if (seq[1] == 'H') { pos = 0; }
-            else if (seq[1] == 'F') { pos = line.len; }
-            else if (seq[1] == '3') {                 /* Delete key: ESC [ 3 ~ */
-                char tilde; if (read(STDIN_FILENO, &tilde, 1) == 1 && tilde == '~' && pos < line.len) {
-                    memmove(line.buf + pos, line.buf + pos + 1, line.len - pos);
-                    line.len--;
+            else if (s1 == 'D') { if (pos > 0) pos--; }
+            else if (s1 == 'H') { pos = 0; }
+            else if (s1 == 'F') { pos = line.len; }
+            else if (s1 >= '0' && s1 <= '9') {        /* parameterised CSI */
+                char params[32]; int plen = 0; params[plen++] = (char)s1;
+                int finalb = -1;
+                for (int i = 0; i < 32; i++) {
+                    int b = read_byte_timeout(100);
+                    if (b < 0) break;
+                    if (b >= 0x40 && b <= 0x7e) { finalb = b; break; }
+                    if (plen < 31) params[plen++] = (char)b;
                 }
+                params[plen] = 0;
+                if (finalb == '~' && strcmp(params, "3") == 0) {  /* Delete key */
+                    if (pos < line.len) {
+                        memmove(line.buf + pos, line.buf + pos + 1, line.len - pos);
+                        line.len--;
+                    }
+                }
+                else if (finalb == '~' && strcmp(params, "200") == 0) {
+                    /* Bracketed paste: insert everything literally until
+                       ESC[201~. Newlines become a single space (this is a
+                       one-line editor) so pasted commands can be reviewed
+                       and run only on the user's own Enter; tabs become a
+                       space, other control bytes and escape sequences are
+                       dropped. */
+                    int pending_cr = 0;
+                    for (;;) {
+                        char pc;
+                        if (read(STDIN_FILENO, &pc, 1) != 1) break;
+                        if (pending_cr && pc == '\n') { pending_cr = 0; continue; }
+                        pending_cr = 0;
+                        if (pc == 27) {
+                            int b1 = read_byte_timeout(100);
+                            if (b1 != '[') continue;
+                            char pp[32]; int pl = 0; int fin = -1;
+                            for (int i = 0; i < 32; i++) {
+                                int b = read_byte_timeout(100);
+                                if (b < 0) break;
+                                if (b >= 0x40 && b <= 0x7e) { fin = b; break; }
+                                if (pl < 31) pp[pl++] = (char)b;
+                            }
+                            pp[pl] = 0;
+                            if (fin == '~' && strcmp(pp, "201") == 0) break;
+                            continue;         /* other escapes in a paste: drop */
+                        }
+                        if (pc == '\r' || pc == '\n') {
+                            if (pc == '\r') pending_cr = 1;
+                            line_insert(&line, &pos, ' ');
+                            continue;
+                        }
+                        if (pc == '\t') { line_insert(&line, &pos, ' '); continue; }
+                        if ((unsigned char)pc >= 32 && (unsigned char)pc != 127)
+                            line_insert(&line, &pos, pc);
+                    }
+                }
+                /* A stray 201~ and every other parameterised sequence
+                   fall here and are dropped whole, with no residue. */
             }
+            /* any other CSI final byte is dropped */
         }
         else if (c == 127 || c == 8) {                /* Backspace */
             if (pos > 0) {
@@ -511,14 +657,16 @@ static char *read_line_tty(const char *prompt) {
             }
         }
         else if (c >= 32 && c < 127) {                /* printable insert */
-            if (line.len + 2 > line.cap) { line.cap *= 2; line.buf = realloc(line.buf, line.cap); }
-            memmove(line.buf + pos + 1, line.buf + pos, line.len - pos + 1);
-            line.buf[pos] = c; pos++; line.len++;
+            line_insert(&line, &pos, c);
         }
     redraw:
         {
-            /* ghost suggestion: dim tail of the newest matching history entry */
+            /* ghost suggestion: dim tail of the newest matching history entry.
+               Never offer a suggestion that does not fit sugg_full whole:
+               what is displayed must be exactly what accepting inserts,
+               never a silently truncated command. */
             const char *sugg = (pos == line.len) ? find_suggestion(line.buf) : NULL;
+            if (sugg && strlen(sugg) >= sizeof(sugg_full)) sugg = NULL;
             sugg_full[0] = 0;
             if (sugg) snprintf(sugg_full, sizeof(sugg_full), "%s", sugg);
             sb_t rp; sb_init(&rp); build_rprompt(&rp);
@@ -574,7 +722,7 @@ static void expand_dollar(sb_t *out, const char **pp) {
 }
 
 static void token_push(token_t **toks, int *n, int *cap, toktype_t type, char *text, int quoted) {
-    if (*n + 1 >= *cap) { *cap *= 2; *toks = realloc(*toks, sizeof(token_t) * *cap); }
+    if (*n + 1 >= *cap) { *cap *= 2; *toks = xrealloc(*toks, sizeof(token_t) * *cap); }
     (*toks)[*n].type = type; (*toks)[*n].text = text; (*toks)[*n].quoted = quoted;
     (*n)++;
 }
@@ -582,7 +730,7 @@ static void token_push(token_t **toks, int *n, int *cap, toktype_t type, char *t
 /* Split a command line into tokens. Returns token array ending with T_END. */
 static token_t *tokenize(const char *input) {
     int cap = 16, n = 0;
-    token_t *toks = malloc(sizeof(token_t) * cap);
+    token_t *toks = xmalloc(sizeof(token_t) * cap);
     const char *p = input;
     while (*p) {
         while (*p == ' ' || *p == '\t') p++;
@@ -644,12 +792,18 @@ typedef struct {
 } cmd_t;
 
 static void cmd_push_arg(cmd_t *c, char *arg) {
-    if (c->argc + 2 > c->argcap) { c->argcap = c->argcap ? c->argcap * 2 : 8; c->argv = realloc(c->argv, sizeof(char *) * c->argcap); }
+    if (c->argc + 2 > c->argcap) { c->argcap = c->argcap ? c->argcap * 2 : 8; c->argv = xrealloc(c->argv, sizeof(char *) * c->argcap); }
     c->argv[c->argc++] = arg;
     c->argv[c->argc] = NULL;
 }
 
-/* Parse tokens into a pipeline. Returns command count, or -1 on syntax error. */
+static void cmds_free(cmd_t *cmds, int nc);
+
+/* Parse tokens into a pipeline. Returns command count, or -1 on syntax error.
+   On every error return the partially built pipeline (cmds[0..nc]) is freed
+   here: the caller frees cmds only when the return value is > 0, so an
+   error path that skipped this would leak the transferred argv strings
+   and redirection paths on every malformed line. */
 static int parse_tokens(token_t *toks, cmd_t *cmds, int *background) {
     int nc = 0;
     *background = 0;
@@ -670,21 +824,28 @@ static int parse_tokens(token_t *toks, cmd_t *cmds, int *background) {
             cmd_push_arg(&cmds[nc], t->text);
             t->text = NULL; /* ownership moved */
         } else if (t->type == T_PIPE) {
-            if (cmds[nc].argc == 0 || nc + 1 >= MAX_CMDS) { fprintf(stderr, "arxsh: syntax error near '|'\n"); return -1; }
+            if (cmds[nc].argc == 0 || nc + 1 >= MAX_CMDS) { fprintf(stderr, "arxsh: syntax error near '|'\n"); cmds_free(cmds, nc + 1); return -1; }
             nc++;
             memset(&cmds[nc], 0, sizeof(cmd_t));
         } else if (t->type == T_IN || t->type == T_OUT || t->type == T_APPEND) {
-            if (toks[i + 1].type != T_WORD) { fprintf(stderr, "arxsh: syntax error: redirection without a target\n"); return -1; }
+            if (toks[i + 1].type != T_WORD) { fprintf(stderr, "arxsh: syntax error: redirection without a target\n"); cmds_free(cmds, nc + 1); return -1; }
             i++;
-            if (t->type == T_IN) cmds[nc].in_path = toks[i].text;
-            else { cmds[nc].out_path = toks[i].text; cmds[nc].append = (t->type == T_APPEND); }
+            /* a repeated redirection replaces the old one: free it first,
+               do not leak it ('> a > b' must not leak 'a') */
+            if (t->type == T_IN) { free(cmds[nc].in_path); cmds[nc].in_path = toks[i].text; }
+            else { free(cmds[nc].out_path); cmds[nc].out_path = toks[i].text; cmds[nc].append = (t->type == T_APPEND); }
             toks[i].text = NULL;
         } else if (t->type == T_BG) {
             *background = 1;
         }
     }
-    if (cmds[nc].argc == 0 && nc == 0) return 0;
-    if (cmds[nc].argc == 0) { fprintf(stderr, "arxsh: syntax error: empty command\n"); return -1; }
+    if (cmds[nc].argc == 0 && nc == 0) {
+        /* empty line, or a redirection-only line: the redirection target
+           (ownership moved into cmds[0]) must not leak on this path */
+        cmds_free(cmds, 1);
+        return 0;
+    }
+    if (cmds[nc].argc == 0) { fprintf(stderr, "arxsh: syntax error: empty command\n"); cmds_free(cmds, nc + 1); return -1; }
     return nc + 1;
 }
 
@@ -751,8 +912,14 @@ static int run_builtin(cmd_t *cmd) {
         char prev[4096]; if (!getcwd(prev, sizeof(prev))) prev[0] = 0;
         if (chdir(dir) != 0) { fprintf(stderr, "arxsh: cd: %s: %s\n", dir, strerror(errno)); return 1; }
         if (prev[0]) setenv("OLDPWD", prev, 1);
-        char now[4096]; if (getcwd(now, sizeof(now))) setenv("PWD", now, 1);
-        if (ac > 1 && strcmp(a[1], "-") == 0) printf("%s\n", now);
+        /* now must be initialised and the print gated on getcwd success,
+           exactly like the setenv: when the new cwd is longer than the
+           buffer getcwd fails (ERANGE) and printing an untouched buffer
+           would emit uninitialised stack memory. */
+        char now[4096]; now[0] = 0;
+        int have_now = (getcwd(now, sizeof(now)) != NULL);
+        if (have_now) setenv("PWD", now, 1);
+        if (ac > 1 && strcmp(a[1], "-") == 0 && have_now) printf("%s\n", now);
         return 0;
     }
     if (strcmp(name, "help") == 0) {
@@ -872,8 +1039,26 @@ static void execute_pipeline(cmd_t *cmds, int nc, int background, const char *cm
         return;
     }
 
+    /* a background launch that cannot be tracked must be refused before
+       forking, not run untracked (see the job_add fallbacks below) */
+    if (background && !job_table_has_free()) {
+        fprintf(stderr, "arxsh: job table full\n");
+        last_status = 1;
+        return;
+    }
+
     int pipes[MAX_CMDS - 1][2];
-    for (int i = 0; i < nc - 1; i++) if (pipe(pipes[i]) < 0) { perror("arxsh: pipe"); last_status = 1; return; }
+    for (int i = 0; i < nc - 1; i++) {
+        if (pipe(pipes[i]) < 0) {
+            perror("arxsh: pipe");
+            /* close the pairs already created: leaking them in the parent
+               for the life of the shell deepens the fd exhaustion that
+               caused the failure (mirror the fork-failure cleanup) */
+            for (int k = 0; k < i; k++) { close(pipes[k][0]); close(pipes[k][1]); }
+            last_status = 1;
+            return;
+        }
+    }
 
     pid_t pids[MAX_CMDS];
     pid_t pgid = 0;
@@ -898,6 +1083,11 @@ static void execute_pipeline(cmd_t *cmds, int nc, int background, const char *cm
             signal(SIGTSTP, SIG_DFL);
             signal(SIGTTIN, SIG_DFL);
             signal(SIGTTOU, SIG_DFL);
+            /* the shell ignores SIGPIPE for itself, but an ignored
+               disposition survives exec: children must get the default
+               back, as under other shells, or pipeline writers never
+               die on a broken pipe and must handle EPIPE themselves */
+            signal(SIGPIPE, SIG_DFL);
             if (i > 0) dup2(pipes[i - 1][0], STDIN_FILENO);
             if (i < nc - 1) dup2(pipes[i][1], STDOUT_FILENO);
             for (int k = 0; k < nc - 1; k++) { close(pipes[k][0]); close(pipes[k][1]); }
@@ -922,6 +1112,13 @@ static void execute_pipeline(cmd_t *cmds, int nc, int background, const char *cm
     if (background) {
         job_t *j = job_add(pgid, pids, nc, cmdline, 0);
         if (j) printf("[%d] %d\n", j->id, (int)pgid);
+        else {
+            /* table filled after the pre-launch check: do not leave the
+               watch records orphaned in the reap table, where no sweep
+               would ever drop them */
+            fprintf(stderr, "arxsh: job table full\n");
+            for (int k = 0; k < nc; k++) reap_drop(pids[k]);
+        }
         last_status = 0;
         return;
     }
@@ -933,6 +1130,12 @@ static void execute_pipeline(cmd_t *cmds, int nc, int background, const char *cm
     if (stopped) {
         job_t *j = job_add(pgid, pids, nc, cmdline, 1);
         if (j) printf("\n[%d] Stopped\t\t%s\n", j->id, j->cmdline);
+        else {
+            /* same orphan hazard as the background path: warn loudly and
+               drop the watch records instead of stranding them */
+            fprintf(stderr, "arxsh: job table full\n");
+            for (int k = 0; k < nc; k++) reap_drop(pids[k]);
+        }
         last_status = 128 + SIGTSTP;
     } else {
         last_status = status;
